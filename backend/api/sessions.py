@@ -7,7 +7,7 @@ from typing import Optional
 import json
 
 from backend.db.session import get_db, AsyncSessionLocal
-from backend.db.models import ChaosSession, SessionStatus, FailureResult, Endpoint, PullRequest, User
+from backend.db.models import ChaosSession, SessionStatus, FailureResult, Endpoint, PullRequest, User, AgentStep
 from backend.agents.orchestrator import ChaosOrchestrator
 from backend.agents.discovery_agent import DiscoveryAgent
 from backend.auth.dependencies import get_current_user, get_optional_user
@@ -310,10 +310,14 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
     prs_result = await db.execute(
         select(PullRequest).where(PullRequest.session_id == session_id)
     )
+    steps_result = await db.execute(
+        select(AgentStep).where(AgentStep.session_id == session_id).order_by(AgentStep.created_at.asc())
+    )
 
     endpoints = endpoints_result.scalars().all()
     failures = failures_result.scalars().all()
     prs = prs_result.scalars().all()
+    steps = steps_result.scalars().all()
 
     return {
         "id": session.id,
@@ -350,6 +354,15 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
                 "files_changed": pr.files_changed, "status": pr.status,
             }
             for pr in prs
+        ],
+        "agent_steps": [
+            {
+                "agent": step.agent,
+                "step_type": step.step_type,
+                "content": step.content,
+                "created_at": step.created_at.isoformat(),
+            }
+            for step in steps
         ],
     }
 

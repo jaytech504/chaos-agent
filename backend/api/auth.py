@@ -38,6 +38,7 @@ async def github_login():
 
 
 @router.get("/github/callback")
+@router.post("/github/callback")
 async def github_callback(
     code: str = Query(..., description="OAuth code from GitHub redirect"),
     db: AsyncSession = Depends(get_db),
