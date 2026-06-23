@@ -73,7 +73,7 @@ async def poll_session(session_id: str):
                 data = r.json()
                 status = data.get("status")
                 if status != last_status:
-                    print(f"  → {status.upper()}: "
+                    print(f"  -> {status.upper()}: "
                           f"endpoints={data.get('endpoints_found', 0)} | "
                           f"failures={data.get('failures_injected', 0)} | "
                           f"unhandled={data.get('unhandled_count', 0)} | "
@@ -114,6 +114,9 @@ async def main():
 
     # Start demo target
     print("\n2. Starting demo target app on port 8001...")
+    import os
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.abspath("demo_target")
     target_proc = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn",
@@ -122,6 +125,7 @@ async def main():
             "--log-level", "warning",
         ],
         cwd=".",
+        env=env,
     )
 
     ready = await wait_for_service(TARGET_URL, "demo target")

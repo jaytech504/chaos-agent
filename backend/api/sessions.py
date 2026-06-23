@@ -2,9 +2,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, delete
 from typing import Optional
 import json
+from loguru import logger
 
 from backend.db.session import get_db, AsyncSessionLocal
 from backend.db.models import ChaosSession, SessionStatus, FailureResult, Endpoint, PullRequest, User, AgentStep
@@ -15,65 +16,39 @@ from backend.auth.dependencies import get_current_user, get_optional_user
 router = APIRouter()
 
 
+from backend.core.draft_cache import draft_cache
+
 # ── Input models ──────────────────────────────────────────────────────────────
 
-class ManualEndpoint(BaseModel):
-    path: str
-    method: str
-    description: str = ""
-    payload: dict = None
-
-
-class StartFromSpecUrl(BaseModel):
-    """Method 1 — OpenAPI spec URL"""
+class StartSessionRequest(BaseModel):
+    draft_id: str
     target_url: str
-    spec_url: str
+    target_name: str = "My API"
+    github_repo: Optional[str] = None
+    selected_temp_ids: list[str]
+
+
+class StartSessionLegacyRequest(BaseModel):
+    target_url: str
     target_name: str = "My API"
     github_repo: Optional[str] = None
 
 
-class StartFromManual(BaseModel):
-    """Method 4 — manual endpoint list"""
-    target_url: str
-    target_name: str = "My API"
-    endpoints: list[ManualEndpoint]
-    github_repo: Optional[str] = None
+# ── Legacy/Direct Start Session ────────────────────────────────────────────────
 
-
-# ── Method 1: OpenAPI spec URL ─────────────────────────────────────────────────
-
-@router.post("/from-spec-url")
-async def start_from_spec_url(
-    body: StartFromSpecUrl,
+@router.post("")
+async def start_session_legacy(
+    body: StartSessionLegacyRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: Optional[User] = Depends(get_optional_user),
 ):
     """
-    Start a chaos session using an OpenAPI spec URL.
-
-    Examples:
-      FastAPI auto-generates:  http://localhost:8001/openapi.json
-      Django with drf-spectacular: https://api.myapp.com/api/schema/
-      Spring Boot:  https://api.myapp.com/v3/api-docs
-      Express with swagger-jsdoc:  https://api.myapp.com/api-docs
+    Directly start a chaos session by auto-discovering endpoints from {target_url}/openapi.json.
     """
     session_id = str(uuid.uuid4())
 
-    # Fetch and parse spec immediately so we can return errors to the user
-    discovery = DiscoveryAgent(db, session_id)
-    try:
-        endpoints = await discovery.from_openapi_url(body.spec_url)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if not endpoints:
-        raise HTTPException(status_code=400,
-                            detail="No endpoints found in the spec. Check the URL.")
-
-    # Resolve GitHub token: user's OAuth token > global fallback
-    github_token = _resolve_github_token(user, body.github_repo)
-
+    # 1. Create and persist session first to satisfy foreign key constraints
     session = ChaosSession(
         id=session_id,
         target_url=body.target_url,
@@ -84,7 +59,29 @@ async def start_from_spec_url(
     )
     db.add(session)
     await db.commit()
+    
+    # 2. Run discovery
+    spec_url = f"{body.target_url.rstrip('/')}/openapi.json"
+    logger.info(f"[Sessions] Legacy direct start. Scanning spec URL: {spec_url}")
+    
+    discovery = DiscoveryAgent(db, session_id)
+    try:
+        endpoints = await discovery.from_openapi_url(spec_url)
+    except Exception as e:
+        logger.error(f"[Sessions] Discovery failed for {spec_url}: {e}")
+        # Clean up session since it failed
+        await db.delete(session)
+        await db.commit()
+        raise HTTPException(status_code=400, detail=f"Failed to discover endpoints from {spec_url}: {e}")
 
+    if not endpoints:
+        # Clean up session
+        await db.delete(session)
+        await db.commit()
+        raise HTTPException(status_code=400, detail="No endpoints found in spec.")
+
+    # 3. Trigger background tasks
+    github_token = _resolve_github_token(user, body.github_repo)
     background_tasks.add_task(
         _run_pipeline_with_endpoints,
         session_id, body.target_url, endpoints, body.github_repo, github_token
@@ -94,152 +91,42 @@ async def start_from_spec_url(
         "session_id": session_id,
         "method": "openapi_url",
         "endpoints_found": len(endpoints),
-        "spec_url": body.spec_url,
-        "github_repo": body.github_repo,
     }
 
 
-# ── Method 2: OpenAPI file upload ──────────────────────────────────────────────
+# ── Start Session from Spec Draft ──────────────────────────────────────────────
 
-@router.post("/from-spec-file")
-async def start_from_spec_file(
-    background_tasks: BackgroundTasks,
-    target_url: str = Form(...),
-    target_name: str = Form("My API"),
-    github_repo: Optional[str] = Form(None),
-    spec_file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    user: Optional[User] = Depends(get_optional_user),
-):
-    """
-    Start a chaos session by uploading an OpenAPI spec file.
-    Accepts: openapi.json, swagger.json, openapi.yaml, swagger.yaml
-    """
-    content = await spec_file.read()
-    content_str = content.decode("utf-8")
-
-    session_id = str(uuid.uuid4())
-    discovery = DiscoveryAgent(db, session_id)
-
-    try:
-        endpoints = await discovery.from_openapi_content(content_str)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if not endpoints:
-        raise HTTPException(status_code=400,
-                            detail="No endpoints found in uploaded spec.")
-
-    github_token = _resolve_github_token(user, github_repo)
-
-    session = ChaosSession(
-        id=session_id,
-        target_url=target_url,
-        target_name=target_name,
-        github_repo=github_repo,
-        user_id=user.id if user else None,
-        status=SessionStatus.PENDING,
-    )
-    db.add(session)
-    await db.commit()
-
-    background_tasks.add_task(
-        _run_pipeline_with_endpoints,
-        session_id, target_url, endpoints, github_repo, github_token
-    )
-
-    return {
-        "session_id": session_id,
-        "method": "openapi_file",
-        "endpoints_found": len(endpoints),
-        "filename": spec_file.filename,
-    }
-
-
-# ── Method 3: Postman Collection upload ────────────────────────────────────────
-
-@router.post("/from-postman")
-async def start_from_postman(
-    background_tasks: BackgroundTasks,
-    target_url: str = Form(...),
-    target_name: str = Form("My API"),
-    github_repo: Optional[str] = Form(None),
-    collection_file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    user: Optional[User] = Depends(get_optional_user),
-):
-    """
-    Start a chaos session from a Postman Collection export.
-    Export from Postman: Collection → ··· → Export → Collection v2.1
-    """
-    content = await collection_file.read()
-    try:
-        collection_data = json.loads(content.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400,
-                            detail="Invalid JSON. Export as Collection v2.1 from Postman.")
-
-    session_id = str(uuid.uuid4())
-    discovery = DiscoveryAgent(db, session_id)
-
-    try:
-        endpoints = await discovery.from_postman_collection(collection_data)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    if not endpoints:
-        raise HTTPException(status_code=400,
-                            detail="No requests found in Postman Collection.")
-
-    github_token = _resolve_github_token(user, github_repo)
-
-    session = ChaosSession(
-        id=session_id,
-        target_url=target_url,
-        target_name=target_name,
-        github_repo=github_repo,
-        user_id=user.id if user else None,
-        status=SessionStatus.PENDING,
-    )
-    db.add(session)
-    await db.commit()
-
-    background_tasks.add_task(
-        _run_pipeline_with_endpoints,
-        session_id, target_url, endpoints, github_repo, github_token
-    )
-
-    return {
-        "session_id": session_id,
-        "method": "postman_collection",
-        "endpoints_found": len(endpoints),
-        "collection": collection_data.get("info", {}).get("name", ""),
-    }
-
-
-# ── Method 4: Manual endpoint entry ───────────────────────────────────────────
-
-@router.post("/from-manual")
-async def start_from_manual(
-    body: StartFromManual,
+@router.post("/start")
+async def start_session(
+    body: StartSessionRequest,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: Optional[User] = Depends(get_optional_user),
 ):
     """
-    Start a chaos session with manually entered endpoints.
-    Useful when no spec is available and for targeting specific endpoints.
+    Start a chaos session using endpoints selected from a parsed draft.
     """
-    if not body.endpoints:
-        raise HTTPException(status_code=400, detail="No endpoints provided.")
+    if not body.selected_temp_ids:
+        raise HTTPException(status_code=400, detail="No endpoints selected.")
+
+    # Retrieve from short-lived TTL cache
+    draft = draft_cache.get(body.draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="Draft spec not found or expired.")
+
+    all_draft_endpoints = draft.get("endpoints", [])
+    filtered_endpoints = [
+        ep for ep in all_draft_endpoints
+        if ep.get("temp_id") in body.selected_temp_ids
+    ]
+
+    if not filtered_endpoints:
+        raise HTTPException(
+            status_code=400,
+            detail="None of the selected endpoints exist in the draft spec."
+        )
 
     session_id = str(uuid.uuid4())
-    discovery = DiscoveryAgent(db, session_id)
-
-    endpoints = await discovery.from_manual_endpoints(
-        [ep.model_dump() for ep in body.endpoints]
-    )
-
     github_token = _resolve_github_token(user, body.github_repo)
 
     session = ChaosSession(
@@ -253,16 +140,25 @@ async def start_from_manual(
     db.add(session)
     await db.commit()
 
+    # Persist only the chosen endpoints
+    discovery = DiscoveryAgent(db, session_id)
+    saved_endpoints = await discovery.save_selected_endpoints(filtered_endpoints)
+
+    # Invalidate cache entry
+    draft_cache.delete(body.draft_id)
+
     background_tasks.add_task(
         _run_pipeline_with_endpoints,
-        session_id, body.target_url, endpoints, body.github_repo, github_token
+        session_id, body.target_url, saved_endpoints, body.github_repo, github_token
     )
 
     return {
         "session_id": session_id,
-        "method": "manual",
-        "endpoints_found": len(endpoints),
+        "method": draft.get("method", "openapi_url"),
+        "endpoints_found": len(saved_endpoints),
+        "github_repo": body.github_repo,
     }
+
 
 
 # ── Session list + detail ──────────────────────────────────────────────────────
@@ -349,9 +245,14 @@ async def get_session(session_id: str, db: AsyncSession = Depends(get_db)):
         ],
         "pull_requests": [
             {
-                "pr_number": pr.pr_number, "pr_url": pr.pr_url,
-                "pr_title": pr.pr_title, "finding_title": pr.finding_title,
-                "files_changed": pr.files_changed, "status": pr.status,
+                "id": pr.id,
+                "pr_number": pr.pr_number,
+                "pr_url": pr.pr_url,
+                "pr_title": pr.pr_title,
+                "finding_title": pr.finding_title,
+                "files_changed": pr.files_changed,
+                "status": pr.status,
+                "branch_name": pr.branch_name,
             }
             for pr in prs
         ],
@@ -408,3 +309,73 @@ async def _run_pipeline_with_endpoints(
             await db.commit()
         except Exception as e:
             await db.rollback()
+
+
+# ── Retry failed session ──────────────────────────────────────────────────────
+
+@router.post("/{session_id}/retry")
+async def retry_session(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_optional_user),
+):
+    """
+    Rerun a failed chaos session using its pre-discovered endpoints.
+    """
+    session = await db.get(ChaosSession, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    if user and session.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Not authorized to retry this session")
+
+    # Update status to pending
+    session.status = SessionStatus.PENDING
+    session.fixes_generated = 0
+    session.prs_opened = 0
+    session.risk_score = 0
+    session.unhandled_count = 0
+    session.completed_at = None
+
+    # Clear previous run results
+    from backend.db.models import FailureResult, AgentStep, Report, PullRequest
+    await db.execute(delete(PullRequest).where(PullRequest.session_id == session_id))
+    await db.execute(delete(Report).where(Report.session_id == session_id))
+    await db.execute(delete(AgentStep).where(AgentStep.session_id == session_id))
+    await db.execute(delete(FailureResult).where(FailureResult.session_id == session_id))
+
+    await db.flush()
+
+    # Load endpoints
+    endpoints_result = await db.execute(
+        select(Endpoint).where(Endpoint.session_id == session_id)
+    )
+    endpoints = endpoints_result.scalars().all()
+    if not endpoints:
+        raise HTTPException(status_code=400, detail="No endpoints found to retry.")
+
+    # Convert endpoints to list of dicts for run_from_endpoints
+    endpoints_payload = [
+        {
+            "id": ep.id,
+            "path": ep.path,
+            "method": ep.method,
+            "description": ep.description,
+            "sample_payload": ep.sample_payload,
+            "dependencies": ep.dependencies,
+        }
+        for ep in endpoints
+    ]
+
+    github_token = _resolve_github_token(user, session.github_repo)
+
+    # Trigger background pipeline rerun
+    background_tasks.add_task(
+        _run_pipeline_with_endpoints,
+        session_id, session.target_url, endpoints_payload, session.github_repo, github_token
+    )
+
+    await db.commit()
+
+    return {"status": "retrying", "session_id": session_id}

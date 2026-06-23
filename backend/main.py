@@ -6,7 +6,7 @@ from loguru import logger
 from backend.core.config import get_settings
 from backend.core.websocket_manager import ws_manager
 from backend.db.session import init_db
-from backend.api import sessions, reports, github, auth
+from backend.api import sessions, reports, github, auth, discovery
 
 settings = get_settings()
 
@@ -36,6 +36,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(discovery.router, prefix="/api/discovery", tags=["discovery"])
 app.include_router(sessions.router, prefix="/api/sessions", tags=["sessions"])
 app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 app.include_router(github.router, prefix="/api/github", tags=["github"])

@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from backend.db.session import get_db
-from backend.db.models import Report, FailureResult
+from backend.db.models import Report, FailureResult, Endpoint
 
 router = APIRouter()
 
@@ -22,6 +22,25 @@ async def get_report(report_id: str, db: AsyncSession = Depends(get_db)):
     )
     fixed_failures = failures_result.scalars().all()
 
+    # Load all endpoints for the session to map endpoint_id -> path
+    endpoints_result = await db.execute(
+        select(Endpoint).where(Endpoint.session_id == report.session_id)
+    )
+    endpoints_map = {ep.id: ep for ep in endpoints_result.scalars().all()}
+
+    # Map (failure_mode, endpoint_id) -> code_before
+    before_code_map = {}
+    for fix in (report.fixes or []):
+        modes = fix.get("failure_modes", [])
+        endpoints = fix.get("affected_endpoints", [])
+        code_before = fix.get("code_before", "")
+        for mode in modes:
+            for ep_path in endpoints:
+                # Find endpoint_id for this path
+                for ep_id, ep_obj in endpoints_map.items():
+                    if ep_obj.path == ep_path:
+                        before_code_map[(mode, ep_id)] = code_before
+
     return {
         "id": report.id,
         "session_id": report.session_id,
@@ -33,9 +52,10 @@ async def get_report(report_id: str, db: AsyncSession = Depends(get_db)):
         "fixed_failures": [
             {
                 "failure_mode": f.failure_mode,
-                "endpoint": f.endpoint_id,
+                "endpoint": endpoints_map[f.endpoint_id].path if f.endpoint_id in endpoints_map else f.endpoint_id,
                 "fix_code": f.fix_code,
                 "fix_explanation": f.fix_explanation,
+                "before_code": before_code_map.get((f.failure_mode, f.endpoint_id), ""),
             }
             for f in fixed_failures
         ],

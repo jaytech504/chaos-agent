@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.agents.chaos_agent import ChaosAgent
 from backend.agents.analyst_agent import AnalystAgent
 from backend.agents.fix_agent import FixAgent
+from backend.agents.review_agent import ReviewAgent
 from backend.agents.github_agent import GitHubAgent
 from backend.core.websocket_manager import ws_manager
 from backend.core.config import get_settings
@@ -15,7 +16,7 @@ settings = get_settings()
 class ChaosOrchestrator:
     """
     Coordinates the pipeline after discovery is complete:
-    Chaos Injection → Analysis → Fix Generation → GitHub PRs
+    Chaos Injection → Analysis → Fix Generation → Review → GitHub PRs
 
     Discovery happens before the orchestrator runs —
     in the API layer via the DiscoveryAgent.
@@ -71,12 +72,89 @@ class ChaosOrchestrator:
                 self.session_id, "fixing",
                 "Generating error handling code..."
             )
-            fixer = FixAgent(self.db, self.session_id)
-            fix_result = await fixer.handle(analysis, failure_results)
-
-            # ── Stage 4: GitHub PRs ───────────────────────────────────────────
             # Resolve token: per-user OAuth token > global fallback
             effective_token = github_token or settings.github_token
+            fixer = FixAgent(
+                self.db, self.session_id,
+                repo_url=github_repo,
+                github_token=effective_token
+            )
+            fix_result = await fixer.handle(analysis, failure_results)
+
+            # ── Stage 3.5: Fix Review ─────────────────────────────────────────
+            # ReviewAgent validates each fix like a senior developer.
+            # If fixes need revision, they go back to FixAgent for correction.
+            if github_repo and effective_token:
+                await ws_manager.emit_status(
+                    self.session_id, "reviewing",
+                    "Senior code review of generated fixes..."
+                )
+                reviewer = ReviewAgent(
+                    self.db, self.session_id,
+                    repo_url=github_repo,
+                    github_token=effective_token,
+                )
+
+                max_review_rounds = 2
+                for review_round in range(max_review_rounds):
+                    fix_result = await reviewer.handle(fix_result)
+
+                    needs_revision = fix_result.get("needs_revision", [])
+                    if not needs_revision:
+                        # All fixes validated — proceed
+                        logger.info(
+                            f"[Orchestrator] Review round {review_round + 1}: "
+                            f"all fixes validated ✓"
+                        )
+                        break
+
+                    logger.info(
+                        f"[Orchestrator] Review round {review_round + 1}: "
+                        f"{len(needs_revision)} fix(es) need revision"
+                    )
+                    await ws_manager.emit_status(
+                        self.session_id, "fixing",
+                        f"Revising {len(needs_revision)} fix(es) based on review feedback..."
+                    )
+
+                    # Send rejected fixes back to FixAgent for revision
+                    revised_fixer = FixAgent(
+                        self.db, self.session_id,
+                        repo_url=github_repo,
+                        github_token=effective_token
+                    )
+                    revised_fixes = await revised_fixer.revise_fixes(needs_revision)
+
+                    # Merge revised fixes back into the result
+                    fix_result["fixes"] = fix_result.get("fixes", []) + revised_fixes
+                    fix_result["fixes_count"] = len(fix_result["fixes"])
+
+                    # Clear the needs_revision list for the next review round
+                    fix_result.pop("needs_revision", None)
+
+                    await ws_manager.emit_status(
+                        self.session_id, "reviewing",
+                        f"Re-reviewing revised fixes (round {review_round + 2})..."
+                    )
+                else:
+                    # Max rounds reached — include remaining unrevised fixes as-is
+                    remaining = fix_result.pop("needs_revision", [])
+                    if remaining:
+                        logger.warning(
+                            f"[Orchestrator] Max review rounds reached. "
+                            f"{len(remaining)} fix(es) included without full validation."
+                        )
+                        fix_result["fixes"] = fix_result.get("fixes", []) + remaining
+                        fix_result["fixes_count"] = len(fix_result["fixes"])
+
+                review_stats = fix_result.get("review_stats", {})
+                logger.info(
+                    f"[Orchestrator] Review complete: "
+                    f"{review_stats.get('validated', 0)} validated, "
+                    f"{review_stats.get('revision_needed', 0)} revised"
+                )
+
+            # ── Stage 4: GitHub PRs ───────────────────────────────────────────
             prs_opened = []
             if github_repo and effective_token:
                 await ws_manager.emit_status(

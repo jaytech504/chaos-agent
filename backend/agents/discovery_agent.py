@@ -47,14 +47,14 @@ class DiscoveryAgent:
     No LLM calls needed — spec parsing is deterministic.
     """
 
-    def __init__(self, db: AsyncSession, session_id: str):
+    def __init__(self, db: AsyncSession = None, session_id: str = ""):
         self.db = db
         self.session_id = session_id
 
-    # ── Public entry points ───────────────────────────────────────────────────
+    # ── Public entry points (Classic/Compatible) ─────────────────────────────────
 
     async def from_openapi_url(self, spec_url: str) -> list[dict]:
-        """Method 1: Fetch and parse an OpenAPI spec from a URL."""
+        """Method 1: Fetch, parse and save an OpenAPI spec from a URL."""
         logger.info(f"[Discovery] Fetching OpenAPI spec from {spec_url}")
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -65,13 +65,14 @@ class DiscoveryAgent:
                     spec = yaml.safe_load(r.text)
                 else:
                     spec = r.json()
-            return await self._parse_openapi(spec, source=spec_url)
+            raw_endpoints = await self._parse_openapi_raw(spec, source=spec_url)
+            return await self._save_endpoints(raw_endpoints)
         except Exception as e:
             logger.error(f"[Discovery] OpenAPI URL fetch failed: {e}")
             raise ValueError(f"Could not fetch OpenAPI spec from {spec_url}: {e}")
 
     async def from_openapi_content(self, content: str | dict) -> list[dict]:
-        """Method 2: Parse an uploaded OpenAPI spec (JSON string, YAML string, or dict)."""
+        """Method 2: Parse and save an uploaded OpenAPI spec."""
         logger.info("[Discovery] Parsing uploaded OpenAPI spec")
         try:
             if isinstance(content, dict):
@@ -80,43 +81,179 @@ class DiscoveryAgent:
                 spec = json.loads(content)
             else:
                 spec = yaml.safe_load(content)
-            return await self._parse_openapi(spec, source="uploaded_file")
+            raw_endpoints = await self._parse_openapi_raw(spec, source="uploaded_file")
+            return await self._save_endpoints(raw_endpoints)
         except Exception as e:
             raise ValueError(f"Could not parse OpenAPI spec: {e}")
 
     async def from_postman_collection(self, collection: str | dict) -> list[dict]:
-        """Method 3: Parse an exported Postman Collection v2.1 JSON."""
+        """Method 3: Parse and save an exported Postman Collection v2.1 JSON."""
         logger.info("[Discovery] Parsing Postman Collection")
         try:
             if isinstance(collection, str):
                 data = json.loads(collection)
             else:
                 data = collection
-            return await self._parse_postman(data)
+            raw_endpoints = await self._parse_postman_raw(data)
+            return await self._save_endpoints(raw_endpoints)
         except Exception as e:
             raise ValueError(f"Could not parse Postman Collection: {e}")
 
     async def from_manual_endpoints(self, endpoints: list[dict]) -> list[dict]:
-        """Method 4: User-provided endpoint list from the UI."""
+        """Method 4: User-provided endpoint list from the UI (save directly)."""
         logger.info(f"[Discovery] Using {len(endpoints)} manually entered endpoints")
-        normalised = []
+        raw_endpoints = []
         for ep in endpoints:
-            normalised.append({
+            raw_endpoints.append({
                 "path": ep.get("path", "/"),
                 "method": ep.get("method", "GET").upper(),
                 "description": ep.get("description", ""),
                 "sample_payload": ep.get("payload"),
                 "dependencies": self._detect_dependencies(ep.get("path", "")),
             })
-        return await self._save_endpoints(normalised)
+        return await self._save_endpoints(raw_endpoints)
 
-    # ── OpenAPI parser ────────────────────────────────────────────────────────
+    # ── Preview entry points (DB-free) ───────────────────────────────────────────
 
-    async def _parse_openapi(self, spec: dict, source: str) -> list[dict]:
-        """
-        Handles OpenAPI 3.x and Swagger 2.x.
-        Extracts every path+method combination with its schema.
-        """
+    async def preview_from_openapi_url(self, spec_url: str) -> dict:
+        """Fetch and parse OpenAPI spec from URL, return grouped by tag preview."""
+        logger.info(f"[Discovery] Previewing OpenAPI spec from {spec_url}")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(spec_url)
+                r.raise_for_status()
+                content_type = r.headers.get("content-type", "")
+                if "yaml" in content_type or spec_url.endswith((".yaml", ".yml")):
+                    spec = yaml.safe_load(r.text)
+                else:
+                    spec = r.json()
+            raw_endpoints = await self._parse_openapi_raw(spec, source=spec_url)
+            return self.group_and_enrich_endpoints(raw_endpoints, "openapi_url")
+        except Exception as e:
+            logger.error(f"[Discovery] OpenAPI URL fetch failed: {e}")
+            raise ValueError(f"Could not fetch OpenAPI spec from {spec_url}: {e}")
+
+    async def preview_from_openapi_content(self, content: str | dict) -> dict:
+        """Parse uploaded OpenAPI spec content, return grouped by tag preview."""
+        logger.info("[Discovery] Previewing uploaded OpenAPI spec")
+        try:
+            if isinstance(content, dict):
+                spec = content
+            elif content.strip().startswith("{"):
+                spec = json.loads(content)
+            else:
+                spec = yaml.safe_load(content)
+            raw_endpoints = await self._parse_openapi_raw(spec, source="uploaded_file")
+            return self.group_and_enrich_endpoints(raw_endpoints, "openapi_file")
+        except Exception as e:
+            raise ValueError(f"Could not parse OpenAPI spec: {e}")
+
+    async def preview_from_postman(self, collection: str | dict) -> dict:
+        """Parse Postman Collection export, return grouped by tag preview."""
+        logger.info("[Discovery] Previewing Postman Collection")
+        try:
+            if isinstance(collection, str):
+                data = json.loads(collection)
+            else:
+                data = collection
+            raw_endpoints = await self._parse_postman_raw(data)
+            return self.group_and_enrich_endpoints(raw_endpoints, "postman")
+        except Exception as e:
+            raise ValueError(f"Could not parse Postman Collection: {e}")
+
+    async def preview_from_manual(self, endpoints: list[dict]) -> dict:
+        """Process manual endpoint inputs, return grouped by tag preview under 'Manual'."""
+        logger.info(f"[Discovery] Previewing {len(endpoints)} manual endpoints")
+        raw_endpoints = []
+        for ep in endpoints:
+            raw_endpoints.append({
+                "path": ep.get("path", "/"),
+                "method": ep.get("method", "GET").upper(),
+                "description": ep.get("description", ""),
+                "sample_payload": ep.get("payload"),
+                "dependencies": self._detect_dependencies(ep.get("path", "")),
+                "folder_tag": "Manual"
+            })
+        return self.group_and_enrich_endpoints(raw_endpoints, "manual")
+
+    # ── Grouping and Enrichment Helper ──────────────────────────────────────────
+
+    def group_and_enrich_endpoints(self, raw_endpoints: list[dict], method_name: str) -> dict:
+        """Deduplicates, tags, and flags endpoints (with risk scores/recommends)."""
+        draft_id = str(uuid.uuid4())
+        
+        seen = set()
+        deduped = []
+        for ep in raw_endpoints:
+            key = f"{ep['method'].upper()}:{ep['path']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(ep)
+            
+        groups_map = {}
+        for ep in deduped:
+            method = ep["method"].upper()
+            path = ep["path"]
+            
+            # Tags
+            tags = ep.get("tags", [])
+            tag = tags[0] if tags else ep.get("folder_tag", "General")
+            
+            # Slugify temp_id
+            path_slug = self._slugify(path)
+            temp_id = f"{method.lower()}-{path_slug}" if path_slug else method.lower()
+            
+            recommended, risk_note = self._check_recommendation(
+                method, path, ep.get("operation_id", ""), ep.get("tags", [])
+            )
+            
+            enriched = {
+                "temp_id": temp_id,
+                "path": path,
+                "method": method,
+                "description": ep.get("description", ""),
+                "sample_payload": ep.get("sample_payload"),
+                "dependencies": ep.get("dependencies", ["database"]),
+                "recommended": recommended,
+                "risk_note": risk_note,
+            }
+            
+            if tag not in groups_map:
+                groups_map[tag] = []
+            groups_map[tag].append(enriched)
+            
+        groups = []
+        for tag, endpoints in groups_map.items():
+            groups.append({
+                "tag": tag,
+                "endpoints": endpoints
+            })
+            
+        # Store flat list of all enriched endpoints under the draft_id
+        flat_endpoints = []
+        for g in groups:
+            flat_endpoints.extend(g["endpoints"])
+            
+        draft_data = {
+            "method": method_name,
+            "endpoints": flat_endpoints,
+        }
+        
+        from backend.core.draft_cache import draft_cache
+        draft_cache.set(draft_id, draft_data)
+        
+        return {
+            "draft_id": draft_id,
+            "method": method_name,
+            "total_endpoints": len(deduped),
+            "groups": groups
+        }
+
+    # ── OpenAPI parser (raw) ───────────────────────────────────────────────────
+
+    async def _parse_openapi_raw(self, spec: dict, source: str) -> list[dict]:
+        """Handles OpenAPI 3.x and Swagger 2.x without database saves."""
         version = spec.get("openapi", spec.get("swagger", ""))
         logger.info(f"[Discovery] OpenAPI version: {version} from {source}")
 
@@ -124,7 +261,6 @@ class DiscoveryAgent:
         paths = spec.get("paths", {})
 
         for path, path_item in paths.items():
-            # Skip noise
             if path.lower() in LOW_VALUE_PATHS:
                 continue
             if any(path.lower().startswith(lv) for lv in
@@ -140,16 +276,13 @@ class DiscoveryAgent:
                 description = operation.get("description", "")
                 tags = operation.get("tags", [])
 
-                # Sample payload from request body schema
                 sample_payload = None
                 if method in ("post", "put", "patch"):
                     sample_payload = self._extract_sample_payload(operation, spec)
 
-                # Dependency detection from all available text
                 context = f"{path} {summary} {description} {' '.join(tags)}"
                 dependencies = self._detect_dependencies(context)
 
-                # Parameters — useful for understanding what the endpoint needs
                 parameters = operation.get("parameters", [])
                 path_params = [p["name"] for p in parameters
                                if p.get("in") == "path"]
@@ -166,7 +299,7 @@ class DiscoveryAgent:
                 })
 
         logger.info(f"[Discovery] Parsed {len(endpoints)} endpoints from OpenAPI spec")
-        return await self._save_endpoints(endpoints)
+        return endpoints
 
     def _extract_sample_payload(self, operation: dict, full_spec: dict) -> dict | None:
         """Build a sample request body from the operation's requestBody schema."""
@@ -245,13 +378,10 @@ class DiscoveryAgent:
 
         return None
 
-    # ── Postman Collection parser ─────────────────────────────────────────────
+    # ── Postman Collection parser (raw) ────────────────────────────────────────
 
-    async def _parse_postman(self, collection: dict) -> list[dict]:
-        """
-        Parse Postman Collection v2 / v2.1 format.
-        Recursively handles folders (item groups).
-        """
+    async def _parse_postman_raw(self, collection: dict) -> list[dict]:
+        """Parse Postman Collection without DB saves."""
         info = collection.get("info", {})
         logger.info(f"[Discovery] Postman collection: {info.get('name', 'Unnamed')}")
 
@@ -267,7 +397,6 @@ class DiscoveryAgent:
             method = request.get("method", "GET").upper()
             url_data = request.get("url", {})
 
-            # URL can be a string or object
             if isinstance(url_data, str):
                 path = self._postman_url_to_path(url_data)
             else:
@@ -284,7 +413,6 @@ class DiscoveryAgent:
             if not path:
                 continue
 
-            # Extract sample payload from raw body
             sample_payload = None
             body = request.get("body", {})
             if body and body.get("mode") == "raw":
@@ -297,6 +425,7 @@ class DiscoveryAgent:
 
             name = req.get("name", f"{method} {path}")
             deps = self._detect_dependencies(f"{path} {name}")
+            tag = req.get("folder_tag", "General")
 
             endpoints.append({
                 "path": path,
@@ -304,22 +433,24 @@ class DiscoveryAgent:
                 "description": name,
                 "sample_payload": sample_payload,
                 "dependencies": deps,
+                "folder_tag": tag,
             })
 
         logger.info(f"[Discovery] Parsed {len(endpoints)} requests from Postman Collection")
-        return await self._save_endpoints(endpoints)
+        return endpoints
 
-    def _flatten_postman_items(self, items: list, prefix: str = "") -> list[dict]:
+    def _flatten_postman_items(self, items: list, parent_folder: str = "General") -> list[dict]:
         """Recursively flatten Postman folder structure."""
         result = []
         for item in items:
             if "item" in item:
-                # This is a folder — recurse
                 result.extend(self._flatten_postman_items(
-                    item["item"], prefix=item.get("name", "")
+                    item["item"], parent_folder=item.get("name", "General")
                 ))
             else:
-                result.append(item)
+                item_copy = dict(item)
+                item_copy["folder_tag"] = parent_folder
+                result.append(item_copy)
         return result
 
     def _postman_url_to_path(self, url: str) -> str:
@@ -328,7 +459,6 @@ class DiscoveryAgent:
             from urllib.parse import urlparse
             parsed = urlparse(url)
             path = parsed.path or "/"
-            # Convert Postman :param style to {param}
             path = "/".join(
                 f"{{{seg.lstrip(':')}}}" if seg.startswith(":") else seg
                 for seg in path.split("/")
@@ -347,13 +477,54 @@ class DiscoveryAgent:
                 found.append(dep)
         return found or ["database"]
 
+    def _slugify(self, text: str) -> str:
+        import re
+        t = text.lower()
+        t = re.sub(r'[^a-z0-9_-]', '-', t)
+        t = re.sub(r'-+', '-', t)
+        return t.strip('-')
+
+    def _check_recommendation(self, method: str, path: str, operation_id: str = "", tags: list[str] = []) -> tuple[bool, str | None]:
+        method_upper = method.upper()
+        is_delete = method_upper == "DELETE"
+        
+        match_terms = ["admin", "impersonate", "webhook", "vault", "subscription", "platform-admin", "delete", "destroy", "remove"]
+        
+        path_lower = path.lower()
+        op_lower = operation_id.lower() if operation_id else ""
+        tags_lower = [t.lower() for t in tags]
+        
+        found_term = None
+        for term in match_terms:
+            if term in path_lower or term in op_lower or any(term in t for t in tags_lower):
+                found_term = term
+                break
+                
+        if is_delete or found_term:
+            if is_delete or found_term in ["delete", "destroy", "remove"]:
+                note = "Destructive endpoint — deletes or removes resources"
+            elif found_term in ["admin", "platform-admin"]:
+                note = "Admin endpoint — modifies platform or administrative state"
+            elif found_term == "impersonate":
+                note = "Privileged endpoint — performs actions on behalf of other users"
+            elif found_term == "webhook":
+                note = "Webhook callback endpoint"
+            elif found_term == "vault":
+                note = "Security sensitive — accesses secrets or credentials"
+            elif found_term == "subscription":
+                note = "Payment/Subscription operation"
+            else:
+                note = f"Potential sensitive action ({found_term})"
+            return False, note
+            
+        return True, None
+
     async def _save_endpoints(self, endpoints: list[dict]) -> list[dict]:
-        """Persist endpoints to DB and update session counter."""
+        """Internal helper to save list to DB (classic compatibility)."""
         saved = []
         seen = set()
 
         for ep in endpoints:
-            # Deduplicate
             key = f"{ep['method']}:{ep['path']}"
             if key in seen:
                 continue
@@ -391,5 +562,9 @@ class DiscoveryAgent:
             for e in saved
         ]
 
+    async def save_selected_endpoints(self, endpoints: list[dict]) -> list[dict]:
+        """Save user-selected endpoints list to DB."""
+        return await self._save_endpoints(endpoints)
+
     async def handle(self, *args, **kwargs):
-        pass  # Entry is via named methods above
+        pass

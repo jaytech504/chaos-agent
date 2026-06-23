@@ -89,8 +89,15 @@ Return JSON:
         all_results = []
 
         for endpoint in endpoints:
-            results = await self._chaos_endpoint(endpoint)
-            all_results.extend(results)
+            try:
+                results = await self._chaos_endpoint(endpoint)
+                all_results.extend(results)
+            except Exception as e:
+                logger.error(
+                    f"[Chaos] Failed to process endpoint "
+                    f"{endpoint.get('method')} {endpoint.get('path')}: {e}"
+                )
+                continue
 
         # Update session counter
         session = await self.db.get(ChaosSession, self.session_id)
@@ -125,51 +132,59 @@ Choose the most relevant failure modes to inject.""",
             if not failure_mode:
                 continue
 
-            raw = await self._inject_and_observe(
-                failure_mode_id=failure_id,
-                endpoint_path=endpoint["path"],
-                method=endpoint["method"],
-                payload=endpoint.get("sample_payload"),
-            )
+            try:
+                raw = await self._inject_and_observe(
+                    failure_mode_id=failure_id,
+                    endpoint_path=endpoint["path"],
+                    method=endpoint["method"],
+                    payload=endpoint.get("sample_payload"),
+                )
 
-            # Determine result classification
-            observation = raw.get("observation", "")
-            if observation in ("unhandled_error_leaked", "no_response"):
-                result_status = FailureStatus.UNHANDLED
-            elif observation in ("server_error_returned",) and raw.get("error_leaked"):
-                result_status = FailureStatus.UNHANDLED
-            elif raw.get("status_code") in (200, 201, 400, 422):
-                result_status = FailureStatus.HANDLED
-            else:
-                result_status = FailureStatus.DEGRADED
+                # Determine result classification
+                observation = raw.get("observation", "")
+                if observation in ("unhandled_error_leaked", "no_response"):
+                    result_status = FailureStatus.UNHANDLED
+                elif observation in ("server_error_returned",) and raw.get("error_leaked"):
+                    result_status = FailureStatus.UNHANDLED
+                elif raw.get("status_code") in (200, 201, 400, 422):
+                    result_status = FailureStatus.HANDLED
+                else:
+                    result_status = FailureStatus.DEGRADED
 
-            # Persist
-            failure_record = FailureResult(
-                id=str(uuid.uuid4()),
-                session_id=self.session_id,
-                endpoint_id=endpoint["id"],
-                failure_mode=failure_id,
-                failure_description=failure_mode.description,
-                status_code_received=raw.get("status_code"),
-                response_body=str(raw.get("response_body", ""))[:1000],
-                response_time_ms=raw.get("response_time_ms"),
-                result=result_status,
-                error_leaked=raw.get("error_leaked", False),
-                stack_trace_leaked=raw.get("stack_trace_leaked", False),
-            )
-            self.db.add(failure_record)
-            await self.db.flush()
+                # Persist
+                failure_record = FailureResult(
+                    id=str(uuid.uuid4()),
+                    session_id=self.session_id,
+                    endpoint_id=endpoint["id"],
+                    failure_mode=failure_id,
+                    failure_description=failure_mode.description,
+                    status_code_received=raw.get("status_code"),
+                    response_body=str(raw.get("response_body", ""))[:1000],
+                    response_time_ms=raw.get("response_time_ms"),
+                    result=result_status,
+                    error_leaked=raw.get("error_leaked", False),
+                    stack_trace_leaked=raw.get("stack_trace_leaked", False),
+                )
+                self.db.add(failure_record)
+                await self.db.flush()
 
-            results.append({
-                "id": failure_record.id,
-                "endpoint_id": endpoint["id"],
-                "endpoint_path": endpoint["path"],
-                "failure_mode": failure_id,
-                "result": result_status.value,
-                "status_code": raw.get("status_code"),
-                "error_leaked": raw.get("error_leaked", False),
-                "response_body": str(raw.get("response_body", ""))[:500],
-            })
+                results.append({
+                    "id": failure_record.id,
+                    "endpoint_id": endpoint["id"],
+                    "endpoint_path": endpoint["path"],
+                    "failure_mode": failure_id,
+                    "result": result_status.value,
+                    "status_code": raw.get("status_code"),
+                    "error_leaked": raw.get("error_leaked", False),
+                    "response_body": str(raw.get("response_body", ""))[:500],
+                })
+
+            except Exception as e:
+                logger.error(
+                    f"[Chaos] Failed injection {failure_id} on "
+                    f"{endpoint.get('method')} {endpoint.get('path')}: {e}"
+                )
+                continue
 
         return results
 

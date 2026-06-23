@@ -73,13 +73,19 @@ export default function SessionReportPage() {
   useEffect(() => {
     const fetchReportData = async () => {
       try {
+        const token = localStorage.getItem("patchflow_token");
+        const headers: Record<string, string> = {};
+        if (token) {
+          headers["Authorization"] = `Bearer ${token}`;
+        }
+
         // 1. Get report ID for session
-        const repIdRes = await fetch(`http://localhost:8000/api/reports/session/${sessionId}`);
+        const repIdRes = await fetch(`http://localhost:8000/api/reports/session/${sessionId}`, { headers });
         if (!repIdRes.ok) throw new Error("Report not found");
         const { report_id } = await repIdRes.json();
 
         // 2. Fetch report details
-        const reportRes = await fetch(`http://localhost:8000/api/reports/${report_id}`);
+        const reportRes = await fetch(`http://localhost:8000/api/reports/${report_id}`, { headers });
         if (!reportRes.ok) throw new Error("Failed to load report details");
         const reportData = await reportRes.json();
 
@@ -108,13 +114,13 @@ export default function SessionReportPage() {
             id: `fix-${idx}`,
             title: `Fix for ${f.failure_mode} on ${f.endpoint}`,
             explanation: f.fix_explanation || "Add exception handler wrapper.",
-            beforeCode: `# Original code fallback\nreturn await handle_request()`,
+            beforeCode: f.before_code || `# Original code fallback\nreturn await handle_request()`,
             afterCode: f.fix_code || "",
           })));
         }
 
         // 3. Fetch PRs from session
-        const sessionRes = await fetch(`http://localhost:8000/api/sessions/${sessionId}`);
+        const sessionRes = await fetch(`http://localhost:8000/api/sessions/${sessionId}`, { headers });
         if (sessionRes.ok) {
           const sessionData = await sessionRes.json();
           if (Array.isArray(sessionData.pull_requests)) {
@@ -225,15 +231,30 @@ export default function SessionReportPage() {
     setTimeout(() => setCopiedFixId(null), 2000);
   };
 
-  const handleMergePR = (id: string) => {
+  const handleMergePR = async (id: string) => {
     setMergingPrId(id);
-    // Simulate real-time merge state transition
-    setTimeout(() => {
+    try {
+      const token = localStorage.getItem("patchflow_token");
+      const res = await fetch(`http://localhost:8000/api/github/${id}/merge`, {
+        method: "POST",
+        headers: {
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to merge PR");
+      }
+      // Optimistic UI update; websocket broadcast will also update this
       setPrs((prevPrs) =>
         prevPrs.map((pr) => (pr.id === id ? { ...pr, status: "Merged" } : pr))
       );
+    } catch (err: any) {
+      console.error("Merge PR error:", err);
+      alert(err.message || "Error merging PR");
+    } finally {
       setMergingPrId(null);
-    }, 1200);
+    }
   };
 
   const getRiskScoreColor = (score: number) => {

@@ -9,7 +9,39 @@ from backend.core.config import get_settings
 from backend.core.websocket_manager import ws_manager
 from backend.db.models import AgentStep
 
+import ast
+
 settings = get_settings()
+
+def robust_json_loads(s: str) -> dict:
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+
+    try:
+        val = ast.literal_eval(s)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    try:
+        cleaned = s.replace("True", "true").replace("False", "false").replace("None", "null")
+        return json.loads(cleaned)
+    except Exception:
+        pass
+        
+    try:
+        pythonified = s.replace("true", "True").replace("false", "False").replace("null", "None")
+        val = ast.literal_eval(pythonified)
+        if isinstance(val, dict):
+            return val
+    except Exception:
+        pass
+
+    raise ValueError(f"Could not parse JSON. Snippet: {s[:200]}")
 
 
 class Tool:
@@ -40,6 +72,7 @@ class BaseAgent(ABC):
         self.client = AsyncOpenAI(
             api_key=settings.qwen_api_key,
             base_url=settings.qwen_base_url,
+            timeout=300.0,
         )
         self._tools: Dict[str, Tool] = {}
 
@@ -59,26 +92,50 @@ class BaseAgent(ABC):
                 await self._log("thought", message.content)
 
             if message.tool_calls:
+                # Sanitize tool call arguments before adding to history.
+                # The API requires arguments to be valid JSON strings.
+                # If the LLM produces malformed JSON (e.g. embedding raw
+                # invalid payloads), we replace with a cleaned version.
+                sanitized_tool_calls = []
+                for tc in message.tool_calls:
+                    try:
+                        # Validate the arguments are parseable JSON
+                        parsed = robust_json_loads(tc.function.arguments)
+                        clean_args = json.dumps(parsed)
+                    except Exception:
+                        # Replace unparseable arguments with an error placeholder
+                        # so the conversation history stays valid
+                        logger.warning(
+                            f"[{self.name}] Sanitizing malformed tool args for "
+                            f"{tc.function.name}: {tc.function.arguments[:120]}"
+                        )
+                        clean_args = json.dumps({
+                            "error": "malformed_arguments",
+                            "raw_snippet": tc.function.arguments[:200],
+                        })
+                    sanitized_tool_calls.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": clean_args,
+                        },
+                    })
+
                 messages.append({
                     "role": "assistant",
                     "content": message.content,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in message.tool_calls
-                    ],
+                    "tool_calls": sanitized_tool_calls,
                 })
+
                 for tc in message.tool_calls:
-                    result = await self._execute_tool(
-                        tc.function.name,
-                        json.loads(tc.function.arguments),
-                    )
+                    try:
+                        args = robust_json_loads(tc.function.arguments)
+                        result = await self._execute_tool(tc.function.name, args)
+                    except Exception as e:
+                        logger.error(f"[{self.name}] Failed to parse/execute tool {tc.function.name}: {e}")
+                        result = {"error": f"Failed to parse tool arguments or execute tool: {e}"}
+
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -162,7 +219,7 @@ class BaseAgent(ABC):
             start = content.find("{")
             end = content.rfind("}") + 1
             if start != -1 and end > start:
-                return json.loads(content[start:end])
+                return robust_json_loads(content[start:end])
         except Exception:
             pass
         return {"summary": content}

@@ -5,7 +5,8 @@ from typing import Optional
 from loguru import logger
 
 from backend.db.session import get_db
-from backend.db.models import PullRequest
+from backend.db.models import PullRequest, User
+from backend.auth.dependencies import get_optional_user
 from backend.core.websocket_manager import ws_manager
 
 router = APIRouter()
@@ -142,3 +143,61 @@ async def sync_pr_status(pr_id: str, db: AsyncSession = Depends(get_db)):
         return {"pr_number": pr_record.pr_number, "status": pr_record.status}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{pr_id}/merge")
+async def merge_pull_request(
+    pr_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: Optional[User] = Depends(get_optional_user),
+):
+    """
+    Merge the specified pull request on GitHub and update its status.
+    """
+    pr_record = await db.get(PullRequest, pr_id)
+    if not pr_record:
+        raise HTTPException(status_code=404, detail="PR not found")
+
+    # Resolve token: user's OAuth token > global fallback
+    from backend.core.config import get_settings
+    settings = get_settings()
+    token = None
+    if user and user.github_access_token:
+        token = user.github_access_token
+    else:
+        token = settings.github_token or None
+
+    if not token:
+        raise HTTPException(status_code=400, detail="No GitHub token available. Please log in with GitHub.")
+
+    try:
+        from github import Github
+        gh = Github(token)
+        repo = gh.get_repo(pr_record.github_repo)
+        gh_pr = repo.get_pull(pr_record.pr_number)
+
+        # Merge the PR
+        merge_status = gh_pr.merge(
+            commit_message="🤖 Auto-merged by Chaos Agent",
+            merge_method="merge"
+        )
+
+        if merge_status.merged:
+            pr_record.status = "merged"
+            await db.commit()
+
+            # Broadcast the merge status update
+            await ws_manager.broadcast(pr_record.session_id, "pr_status_updated", {
+                "pr_number": pr_record.pr_number,
+                "status": "merged",
+                "merged": True,
+                "finding_title": pr_record.finding_title,
+            })
+            return {"ok": True, "status": "merged", "message": merge_status.message}
+        else:
+            raise HTTPException(status_code=500, detail=f"Merge failed: {merge_status.message}")
+
+    except Exception as e:
+        logger.error(f"[GitHub API] Merge error for PR {pr_record.pr_number}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
