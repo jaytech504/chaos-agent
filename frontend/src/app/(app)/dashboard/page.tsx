@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import Link from "next/link";
-import { Plus, Play, CheckCircle2, XCircle, Loader2 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
-import { buttonVariants } from "@/components/ui/button";
+import { Plus, CheckCircle2, XCircle, Activity, AlertTriangle, GitPullRequest, Gauge } from "lucide-react";
+import { motion } from "framer-motion";
 import { cn } from "@/lib/utils";
 
 interface Session {
@@ -89,133 +88,232 @@ export default function DashboardPage() {
     fetchSessions();
   }, []);
 
+  const stats = useMemo(() => {
+    const totalTests = sessions.length;
+    const totalFailures = sessions.reduce((sum, s) => sum + s.failuresFound, 0);
+    const totalFixes = sessions.reduce((sum, s) => sum + s.fixesGenerated, 0);
+    const totalEndpoints = sessions.reduce((sum, s) => sum + s.endpointsTested, 0);
+    const avgRiskScore = totalEndpoints > 0 
+      ? Math.min(100, Math.round((totalFailures / totalEndpoints) * 100)) 
+      : 0;
+    
+    let scoreColor = "#16A34A";
+    if (avgRiskScore >= 30 && avgRiskScore <= 60) scoreColor = "#E04E16";
+    else if (avgRiskScore > 60) scoreColor = "#DC2626";
+
+    return { totalTests, totalFailures, totalFixes, avgRiskScore, scoreColor };
+  }, [sessions]);
+
   const getStatusBadge = (status: string) => {
     const s = status.toLowerCase();
     if (s === "complete" || s === "completed") {
       return (
-        <Badge className="bg-emerald-500 hover:bg-emerald-600 text-white flex items-center gap-1">
+        <div className="flex items-center gap-1.5 bg-[#F0FDF4] text-[#16A34A] text-[11px] font-[600] px-[10px] py-[4px] rounded-full">
           <CheckCircle2 className="h-3 w-3" />
           <span>Complete</span>
-        </Badge>
+        </div>
       );
     }
     if (s === "failed") {
       return (
-        <Badge className="bg-destructive hover:bg-destructive/90 text-white flex items-center gap-1">
+        <div className="flex items-center gap-1.5 bg-[#FEF2F2] text-[#DC2626] text-[11px] font-[600] px-[10px] py-[4px] rounded-full">
           <XCircle className="h-3 w-3" />
           <span>Failed</span>
-        </Badge>
+        </div>
       );
     }
     // Any other state (pending, discovering, injecting, analysing, fixing, opening_prs) is running
     return (
-      <Badge className="bg-blue-500 hover:bg-blue-600 text-white flex items-center gap-1 animate-pulse">
-        <Loader2 className="h-3 w-3 animate-spin" />
+      <div className="flex items-center gap-1.5 bg-[#FFEDE3] text-[#E04E16] text-[11px] font-[600] px-[10px] py-[4px] rounded-full">
+        <div className="h-1.5 w-1.5 rounded-full bg-[#E04E16] animate-pulse" />
         <span>{status.charAt(0).toUpperCase() + status.slice(1)}</span>
-      </Badge>
+      </div>
     );
   };
 
   return (
-    <div className="mx-auto max-w-7xl px-6 py-12 w-full flex flex-col bg-white min-h-[calc(100vh-4rem)]">
-      {/* Top Section */}
-      <div className="flex items-center justify-between pb-8 border-b border-zinc-100">
+    <div className="mx-auto max-w-5xl px-6 py-12 w-full flex flex-col min-h-screen">
+      {/* Page Header */}
+      <div className="flex items-center justify-between pb-6 border-b border-[#E7E5E2] mb-[24px]">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-zinc-900">Dashboard</h1>
-          <p className="text-sm text-zinc-500 mt-1">
+          <h1 className="text-[32px] font-[800] text-[#111110] leading-none">Dashboard</h1>
+          <p className="text-[15px] text-[#6F6B66] mt-2">
             API reliability testing reports and active sessions.
           </p>
         </div>
-
         <Link
           href="/sessions/new"
-          className={cn(buttonVariants({ size: "lg" }), "flex items-center gap-2 font-medium")}
+          className="bg-[#FF5A1F] hover:bg-[#E04E16] text-white font-[600] rounded-[10px] px-[20px] py-[12px] flex items-center gap-2 transition-all duration-150 hover:-translate-y-[1px] hover:shadow-sm"
         >
           <Plus className="h-4.5 w-4.5" />
           <span>Run New Test</span>
         </Link>
       </div>
 
+      {!loading && sessions.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-[16px] mb-[32px]">
+          {/* Card 1 */}
+          <motion.div
+            initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: "easeOut", delay: 0.0 }}
+            className="bg-white border border-[#E7E5E2] rounded-[14px] p-[20px] hover:border-[#D4D1CC] transition-colors duration-150 flex flex-col"
+          >
+            <Activity className="h-[18px] w-[18px] text-[#A3A099] mb-4" />
+            <span className="text-[24px] font-[800] text-[#111110] leading-none mb-1">{stats.totalTests}</span>
+            <span className="text-[13px] text-[#6F6B66]">Total tests run</span>
+          </motion.div>
+
+          {/* Card 2 */}
+          <motion.div
+            initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: "easeOut", delay: 0.06 }}
+            className="bg-white border border-[#E7E5E2] rounded-[14px] p-[20px] hover:border-[#D4D1CC] transition-colors duration-150 flex flex-col"
+          >
+            <AlertTriangle className="h-[18px] w-[18px] text-[#DC2626] mb-4" />
+            <span className="text-[24px] font-[800] text-[#DC2626] leading-none mb-1">{stats.totalFailures}</span>
+            <span className="text-[13px] text-[#6F6B66]">Failures found</span>
+          </motion.div>
+
+          {/* Card 3 */}
+          <motion.div
+            initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: "easeOut", delay: 0.12 }}
+            className="bg-white border border-[#E7E5E2] rounded-[14px] p-[20px] hover:border-[#D4D1CC] transition-colors duration-150 flex flex-col"
+          >
+            <GitPullRequest className="h-[18px] w-[18px] text-[#16A34A] mb-4" />
+            <span className="text-[24px] font-[800] text-[#16A34A] leading-none mb-1">{stats.totalFixes}</span>
+            <span className="text-[13px] text-[#6F6B66]">Fixes generated</span>
+          </motion.div>
+
+          {/* Card 4 */}
+          <motion.div
+            initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: "easeOut", delay: 0.18 }}
+            className="bg-white border border-[#E7E5E2] rounded-[14px] p-[20px] hover:border-[#D4D1CC] transition-colors duration-150 flex flex-col"
+          >
+            <Gauge className="h-[18px] w-[18px] text-[#111110] mb-4" />
+            <span className="text-[24px] font-[800] leading-none mb-1" style={{ color: stats.scoreColor }}>{stats.avgRiskScore}/100</span>
+            <span className="text-[13px] text-[#6F6B66]">Average risk score</span>
+          </motion.div>
+        </div>
+      )}
+
       {loading ? (
-        <div className="flex flex-col items-center justify-center py-20 gap-4">
-          <Loader2 className="h-8 w-8 text-primary animate-spin" />
-          <p className="text-sm text-zinc-400">Loading your test reports...</p>
+        <div className="flex flex-col gap-[16px]">
+          {[1, 2, 3].map((i) => (
+            <div key={i} className="bg-card border border-[#E7E5E2] rounded-[16px] p-[24px]">
+              <div className="flex justify-between items-center mb-2">
+                <div className="h-5 w-48 bg-[#F3F2F0] animate-pulse rounded" />
+                <div className="h-4 w-24 bg-[#F3F2F0] animate-pulse rounded" />
+              </div>
+              <div className="h-4 w-64 bg-[#F3F2F0] animate-pulse rounded mb-6" />
+              <div className="flex gap-[24px]">
+                <div className="flex flex-col gap-2">
+                  <div className="h-3 w-20 bg-[#F3F2F0] animate-pulse rounded" />
+                  <div className="h-6 w-12 bg-[#F3F2F0] animate-pulse rounded" />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <div className="h-3 w-20 bg-[#F3F2F0] animate-pulse rounded" />
+                  <div className="h-6 w-12 bg-[#F3F2F0] animate-pulse rounded" />
+                </div>
+                <div className="flex flex-col gap-2">
+                  <div className="h-3 w-20 bg-[#F3F2F0] animate-pulse rounded" />
+                  <div className="h-6 w-12 bg-[#F3F2F0] animate-pulse rounded" />
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : sessions.length === 0 ? (
+        <div className="flex flex-col items-center justify-center text-center mt-[120px]">
+          <Activity className="h-[48px] w-[48px] text-[#D4D1CC] mb-4" />
+          <h2 className="text-[18px] font-[700] text-[#111110] mb-2">No tests yet</h2>
+          <p className="text-[14px] text-[#6F6B66] mb-6">Run your first reliability test to find what breaks.</p>
+          <Link
+            href="/sessions/new"
+            className="bg-[#FF5A1F] hover:bg-[#E04E16] text-white font-[600] rounded-[10px] px-[20px] py-[12px] flex items-center gap-2 transition-all duration-150 hover:-translate-y-[1px] hover:shadow-sm"
+          >
+            <Plus className="h-4.5 w-4.5" />
+            <span>Run New Test</span>
+          </Link>
         </div>
       ) : (
-        <div className="mt-8 flex flex-col gap-4">
-          {sessions.length === 0 ? (
-            <div className="text-center py-20 border border-dashed rounded-xl bg-zinc-50/50">
-              <p className="text-sm text-zinc-400">No test runs found. Click "Run New Test" to get started.</p>
-            </div>
-          ) : (
-            sessions.map((session) => {
-              const s = session.status.toLowerCase();
-              const isRunning = !["complete", "completed", "failed"].includes(s);
-              const linkTarget = isRunning
-                ? `/sessions/${session.id}`
-                : `/sessions/${session.id}/report`;
+        <div className="flex flex-col">
+          {sessions.map((session, index) => {
+            const s = session.status.toLowerCase();
+            const isRunning = !["complete", "completed", "failed"].includes(s);
+            const linkTarget = isRunning
+              ? `/sessions/${session.id}`
+              : `/sessions/${session.id}/report`;
 
-              return (
+            return (
+              <motion.div
+                key={session.id}
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.3, ease: "easeOut", delay: (index + 4) * 0.06 }}
+                className="mb-[16px]"
+              >
                 <Link
-                  key={session.id}
                   href={linkTarget}
-                  className="flex flex-col sm:flex-row sm:items-center justify-between p-6 bg-white border border-zinc-200 rounded-xl hover:border-zinc-400 transition-all hover:shadow-sm cursor-pointer group gap-6"
+                  className="block bg-card border border-[#E7E5E2] rounded-[16px] p-[24px] hover:border-[#D4D1CC] transition-all duration-150 hover:-translate-y-[1px] hover:shadow-[0_4px_12px_rgba(0,0,0,0.04)]"
                 >
-                  <div className="flex flex-col gap-2">
+                  {/* Row 1 */}
+                  <div className="flex items-center justify-between mb-1">
                     <div className="flex items-center gap-3">
-                      <span className="font-bold text-lg text-zinc-900 group-hover:text-primary transition-colors">
+                      <span className="text-[17px] font-[700] text-[#111110]">
                         {session.appName}
                       </span>
                       {getStatusBadge(session.status)}
                     </div>
-                    <span className="text-sm text-zinc-500 font-mono">
-                      {session.appUrl}
+                    <span 
+                      className="text-[13px] text-[#A3A099]"
+                      title={session.date !== "Just now" && session.date !== "unknown" ? new Date(session.date).toLocaleString() : undefined}
+                    >
+                      {session.date}
                     </span>
                   </div>
 
-                  {/* Stats Row */}
-                  <div className="flex flex-wrap items-center gap-8 sm:gap-12">
+                  {/* Row 2 */}
+                  <div className="text-[13px] font-mono text-[#6F6B66] truncate mb-[16px]">
+                    {session.appUrl}
+                  </div>
+
+                  {/* Row 3 */}
+                  <div className="flex items-center gap-[24px]">
                     <div className="flex flex-col">
-                      <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                      <span className="text-[11px] text-[#A3A099] uppercase tracking-[0.04em] mb-1">
                         Endpoints Tested
                       </span>
-                      <span className="text-lg font-bold text-zinc-800 mt-1">
+                      <span className="text-[22px] font-[700] text-[#111110] leading-none">
                         {session.endpointsTested}
                       </span>
                     </div>
 
                     <div className="flex flex-col">
-                      <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                      <span className="text-[11px] text-[#A3A099] uppercase tracking-[0.04em] mb-1">
                         Failures Found
                       </span>
                       <span className={cn(
-                        "text-lg font-bold mt-1",
-                        session.failuresFound > 0 && s !== "failed" ? "text-destructive" : "text-zinc-800"
+                        "text-[22px] font-[700] leading-none",
+                        session.failuresFound > 0 && s !== "failed" ? "text-[#DC2626]" : "text-[#111110]"
                       )}>
                         {s === "failed" ? "-" : session.failuresFound}
                       </span>
                     </div>
 
                     <div className="flex flex-col">
-                      <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">
+                      <span className="text-[11px] text-[#A3A099] uppercase tracking-[0.04em] mb-1">
                         Fixes Generated
                       </span>
                       <span className={cn(
-                        "text-lg font-bold mt-1",
-                        session.fixesGenerated > 0 ? "text-primary" : "text-zinc-800"
+                        "text-[22px] font-[700] leading-none",
+                        session.fixesGenerated > 0 && s !== "failed" ? "text-[#16A34A]" : "text-[#111110]"
                       )}>
                         {s === "failed" ? "-" : session.fixesGenerated}
                       </span>
                     </div>
-
-                    <div className="flex flex-col text-right sm:min-w-[100px] justify-center">
-                      <span className="text-xs text-zinc-400">{session.date}</span>
-                    </div>
                   </div>
                 </Link>
-              );
-            })
-          )}
+              </motion.div>
+            );
+          })}
         </div>
       )}
     </div>

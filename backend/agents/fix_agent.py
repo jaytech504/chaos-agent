@@ -192,6 +192,9 @@ Rules:
 {lang_rules}
 - CRITICAL: Do NOT invent helper functions like `_get_cached()` or `_store_result()`. Inline the logic instead.
 - Do NOT add section dividers or comment headers like "# --- Endpoint: ... ---"
+- Do NOT include meta-instruction comments like "# At line X, add..." or "# Add to existing import block". These are NOT code.
+- Put ALL needed imports in the "imports_needed" array. Do NOT put import statements inside code_after.
+- The imports_needed array must contain ONLY actual import lines (e.g. "import logging", "from fastapi import HTTPException"). Do NOT include non-import setup like "logger = logging.getLogger(__name__)" — put those in code_after if needed.
 
 Return JSON:
 {{

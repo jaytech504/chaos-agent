@@ -214,6 +214,32 @@ Return JSON:
         if self._temp_dir and os.path.exists(self._temp_dir):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
 
+    def _sanitize_fixed_code(self, fixed_code: str) -> str:
+        """Strip LLM instruction-comments that leak into generated code.
+
+        The LLM sometimes embeds meta-instructions like:
+          # At line 15, add to existing import block:
+          # import logging
+        These are not real code and cause merge conflicts when applied.
+        """
+        cleaned_lines = []
+        skip_patterns = [
+            "# At line ",
+            "# Add to existing import",
+            "# Add this to the import",
+            "# Insert at ",
+            "# Place at ",
+            "# --- Endpoint:",
+            "# ── Endpoint:",
+        ]
+        for line in fixed_code.splitlines():
+            stripped = line.strip()
+            if any(stripped.startswith(pat) for pat in skip_patterns):
+                logger.debug(f"[GitHub] Stripped instruction-comment: {stripped}")
+                continue
+            cleaned_lines.append(line)
+        return "\n".join(cleaned_lines)
+
     def _apply_fix_to_file(self, file_path: str, original_code: str, fixed_code: str,
                             imports_needed: list[str],
                             start_line: int | None = None,
@@ -232,16 +258,33 @@ Return JSON:
 
         content = full_path.read_text(encoding="utf-8")
 
-        # Add missing imports at top of file
+        # Sanitize LLM output — strip instruction-comments
+        fixed_code = self._sanitize_fixed_code(fixed_code)
+
+        # Add missing imports — check EACH line individually to avoid duplicates
         if imports_needed:
-            import_block = "\n".join(imports_needed)
-            if import_block not in content:
-                lines = content.splitlines()
-                last_import_line = 0
-                for i, line in enumerate(lines):
-                    if line.startswith("import ") or line.startswith("from "):
-                        last_import_line = i
-                lines.insert(last_import_line + 1, import_block)
+            lines = content.splitlines()
+            last_import_line = 0
+            for i, line in enumerate(lines):
+                if line.startswith("import ") or line.startswith("from "):
+                    last_import_line = i
+
+            new_imports = []
+            for imp in imports_needed:
+                imp_stripped = imp.strip()
+                if not imp_stripped:
+                    continue
+                # Skip if this exact import line already exists in the file
+                already_present = any(
+                    existing_line.strip() == imp_stripped
+                    for existing_line in lines
+                )
+                if not already_present:
+                    new_imports.append(imp_stripped)
+
+            if new_imports:
+                for offset, imp_line in enumerate(new_imports):
+                    lines.insert(last_import_line + 1 + offset, imp_line)
                 content = "\n".join(lines)
 
         # Strategy 1: Exact string replacement
@@ -266,8 +309,47 @@ Return JSON:
                 logger.warning(f"[GitHub] Line range {start_line}-{end_line} out of bounds for {file_path} ({len(lines)} lines)")
 
         # No strategy worked — skip this fix
-        logger.warning(f"[GitHub] Could not apply fix to {file_path} — neither string match nor line-range succeeded")
+        logger.warning(f"[GitHub] Could not apply fix to {file_path} -- neither string match nor line-range succeeded")
         return False
+
+    def _post_process_file(self, file_path: str):
+        """Clean up a file after all fixes have been applied.
+
+        - Deduplicate import lines (preserves order, keeps first occurrence)
+        - Remove blank-line runs longer than 2
+        """
+        full_path = Path(self._repo_path) / file_path
+        if not full_path.exists():
+            return
+
+        lines = full_path.read_text(encoding="utf-8").splitlines()
+
+        # --- Pass 1: Deduplicate import lines ---
+        seen_imports = set()
+        deduped = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                if stripped in seen_imports:
+                    logger.debug(f"[GitHub] Removed duplicate import: {stripped}")
+                    continue
+                seen_imports.add(stripped)
+            deduped.append(line)
+
+        # --- Pass 2: Collapse excessive blank lines (max 2 consecutive) ---
+        cleaned = []
+        blank_count = 0
+        for line in deduped:
+            if line.strip() == "":
+                blank_count += 1
+                if blank_count <= 2:
+                    cleaned.append(line)
+            else:
+                blank_count = 0
+                cleaned.append(line)
+
+        full_path.write_text("\n".join(cleaned), encoding="utf-8")
+        logger.info(f"[GitHub] Post-processed {file_path}: deduped imports, cleaned whitespace")
 
     def _create_branch_and_pr(
         self,
@@ -420,6 +502,10 @@ This PR consolidates **{len(fixes_applied)}** error-handling fix(es) identified 
             await ws_manager.emit_status(self.session_id, "github_failed",
                                          "No fixes could be applied to the codebase")
             return []
+
+        # Post-process every changed file: deduplicate imports, clean whitespace
+        for fp in files_changed:
+            self._post_process_file(fp)
 
         # Build ONE consolidated branch + PR
         branch_name = f"chaos-agent/fixes-{self.session_id[:8]}"
