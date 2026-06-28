@@ -3,28 +3,15 @@
 import { useEffect, useState, useRef } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   ArrowLeft,
-  ExternalLink,
   GitPullRequest,
-  CheckCircle2,
-  AlertTriangle,
-  XCircle,
   Copy,
   Check,
   ChevronDown,
-  ChevronUp,
-  GitMerge,
   Loader2,
 } from "lucide-react";
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 interface Finding {
@@ -67,6 +54,7 @@ export default function SessionReportPage() {
   const [expandedFindings, setExpandedFindings] = useState<Record<string, boolean>>({});
   const [copiedFixId, setCopiedFixId] = useState<string | null>(null);
   const [mergingPrId, setMergingPrId] = useState<string | null>(null);
+  const [activeSection, setActiveSection] = useState<string>("risk-score");
 
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -128,7 +116,7 @@ export default function SessionReportPage() {
               id: pr.id || `pr-${idx}`,
               number: pr.pr_number ? `#${pr.pr_number}` : "#",
               title: pr.pr_title || "fix: API reliability improvements",
-              fileChanged: Array.isArray(pr.files_changed) ? pr.files_changed[0] : "app.py",
+              fileChanged: Array.isArray(pr.files_changed) && pr.files_changed.length > 0 ? pr.files_changed[0] : "app.py",
               status: pr.status === "merged" ? "Merged" : pr.status === "closed" ? "Closed" : "Open",
               url: pr.pr_url || "#",
               branch: pr.branch_name || "chaos-agent/api-fix",
@@ -221,6 +209,28 @@ export default function SessionReportPage() {
     };
   }, [sessionId]);
 
+  useEffect(() => {
+    if (loading) return;
+    const sections = ["risk-score", "findings", "pull-requests", "fixes"];
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            setActiveSection(entry.target.id);
+          }
+        });
+      },
+      { rootMargin: "-20% 0px -60% 0px", threshold: 0.1 }
+    );
+
+    sections.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) observer.observe(el);
+    });
+
+    return () => observer.disconnect();
+  }, [loading, findings.length, fixes.length, prs.length]);
+
   const toggleFinding = (id: string) => {
     setExpandedFindings((prev) => ({ ...prev, [id]: !prev[id] }));
   };
@@ -228,292 +238,369 @@ export default function SessionReportPage() {
   const handleCopy = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
     setCopiedFixId(id);
-    setTimeout(() => setCopiedFixId(null), 2000);
+    setTimeout(() => setCopiedFixId(null), 1500);
   };
 
-  const handleMergePR = async (id: string) => {
-    setMergingPrId(id);
-    try {
-      const token = localStorage.getItem("patchflow_token");
-      const res = await fetch(`http://localhost:8000/api/github/${id}/merge`, {
-        method: "POST",
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        },
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to merge PR");
-      }
-      // Optimistic UI update; websocket broadcast will also update this
-      setPrs((prevPrs) =>
-        prevPrs.map((pr) => (pr.id === id ? { ...pr, status: "Merged" } : pr))
-      );
-    } catch (err: any) {
-      console.error("Merge PR error:", err);
-      alert(err.message || "Error merging PR");
-    } finally {
-      setMergingPrId(null);
+  const scrollToSection = (id: string) => {
+    const el = document.getElementById(id);
+    if (el) {
+      const y = el.getBoundingClientRect().top + window.pageYOffset - 120; // Offset for sticky nav
+      window.scrollTo({ top: y, behavior: "smooth" });
     }
   };
 
-  const getRiskScoreColor = (score: number) => {
-    if (score >= 80) return "text-red-500 border-red-200 bg-red-50/50";
-    if (score >= 50) return "text-amber-500 border-amber-200 bg-amber-50/50";
-    return "text-emerald-500 border-emerald-200 bg-emerald-50/50";
+  const renderHighlightedSummary = (text: string, colorClass: string) => {
+    // A simple heuristic to bold some critical phrases (fallback mechanism for mock/demo purposes)
+    const criticalPhrases = ["leak internal details", "unhandled payment gateway connection timeouts", "leak trace details", "blocks indefinitely", "raw exceptions"];
+    let rendered = text;
+    criticalPhrases.forEach((phrase) => {
+      const regex = new RegExp(`(${phrase})`, "gi");
+      rendered = rendered.replace(regex, `<strong class="${colorClass}">$1</strong>`);
+    });
+    return <span dangerouslySetInnerHTML={{ __html: rendered }} />;
   };
 
-  const getSeverityBadge = (severity: Finding["severity"]) => {
+  const getSeverityPill = (score: number) => {
+    if (score > 60) return { label: "HIGH RISK", bg: "bg-[#FEF2F2]", text: "text-[#DC2626]", colorClass: "text-[#DC2626]" };
+    if (score >= 30) return { label: "MODERATE RISK", bg: "bg-[#FFEDE3]", text: "text-[#E04E16]", colorClass: "text-[#E04E16]" };
+    return { label: "LOW RISK", bg: "bg-[#F0FDF4]", text: "text-[#16A34A]", colorClass: "text-[#16A34A]" };
+  };
+
+  const getFindingSeverityBadge = (severity: string) => {
     switch (severity) {
       case "CRITICAL":
-        return <Badge variant="destructive" className="font-semibold">CRITICAL</Badge>;
+        return "bg-[#FEF2F2] text-[#DC2626]";
       case "HIGH":
-        return <Badge className="bg-orange-500 hover:bg-orange-600 text-white font-semibold">HIGH</Badge>;
+        return "bg-[#FFEDE3] text-[#E04E16]";
       case "MEDIUM":
-        return <Badge className="bg-amber-600 hover:bg-amber-700 text-white font-semibold">MEDIUM</Badge>;
+        return "bg-[#FFFBEB] text-[#D97706]";
       default:
-        return <Badge variant="secondary" className="font-semibold">LOW</Badge>;
+        return "bg-[#EFF6FF] text-[#2563EB]";
     }
   };
 
-  return (
-    <div className="mx-auto max-w-5xl px-6 py-12 w-full flex flex-col gap-10 bg-white min-h-[calc(100vh-4rem)]">
-      {/* Back Header */}
-      <div>
-        <Link
-          href="/dashboard"
-          className="text-sm font-semibold text-primary hover:underline flex items-center gap-1.5 w-fit"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          <span>Back to Dashboard</span>
-        </Link>
+  const severityPill = getSeverityPill(riskScore);
+
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-20 gap-4 flex-1 min-h-[calc(100vh-4rem)] bg-[#FAFAF9]">
+        <Loader2 className="h-8 w-8 text-[#FF5A1F] animate-spin" />
+        <p className="text-[14px] text-[#A3A099] font-[500]">Fetching reliability report...</p>
       </div>
+    );
+  }
 
-      {loading ? (
-        <div className="flex flex-col items-center justify-center py-20 gap-4 flex-1">
-          <Loader2 className="h-8 w-8 text-primary animate-spin" />
-          <p className="text-sm text-zinc-400 font-medium">Fetching vulnerability analysis report...</p>
-        </div>
-      ) : (
-        <>
-          {/* Title */}
-          <div className="border-b border-zinc-100 pb-6 flex items-center justify-between gap-4 flex-wrap">
-            <div>
-              <h1 className="text-3xl font-bold tracking-tight text-zinc-900">Reliability Report</h1>
-              <p className="text-sm text-zinc-500 mt-1">
-                Scanned target details &middot; {findings.length} findings listed
-              </p>
-            </div>
+  return (
+    <div className="min-h-screen bg-[#FAFAF9] flex flex-col w-full">
+      <div className="mx-auto max-w-5xl px-6 py-12 w-full flex flex-col">
+        {/* Page Header */}
+        <div className="pb-6 border-b border-[#E7E5E2] flex flex-col gap-3">
+          <Link
+            href="/dashboard"
+            className="text-[13px] text-[#6F6B66] hover:text-[#111110] transition-colors flex items-center gap-1.5 w-fit"
+          >
+            <ArrowLeft className="h-[14px] w-[14px]" />
+            <span>Dashboard</span>
+          </Link>
+          <div>
+            <h1 className="text-[32px] font-[800] text-[#111110] leading-tight">Reliability Report</h1>
+            <p className="text-[14px] text-[#6F6B66] mt-1">
+              Scanned target details · {findings.length} findings listed
+            </p>
           </div>
+        </div>
 
+        {/* Sticky Sub-nav */}
+        <div className="sticky top-0 z-40 bg-[#FAFAF9]/80 backdrop-blur-md border-b border-[#E7E5E2] flex items-center gap-6 pt-1 mb-8">
+          {["risk-score", "findings", "pull-requests", "fixes"].map((id, index) => {
+            const labels = ["Risk Score", "Findings", "Pull Requests", "Fixes"];
+            const label = labels[index];
+            const isActive = activeSection === id;
+            return (
+              <button
+                key={id}
+                onClick={() => scrollToSection(id)}
+                className={cn(
+                  "py-[12px] text-[13px] font-[500] border-b-[2px] transition-colors",
+                  isActive
+                    ? "text-[#111110] border-[#FF5A1F]"
+                    : "text-[#6F6B66] border-transparent hover:text-[#111110]"
+                )}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Content Sections */}
+        <div className="flex flex-col gap-[32px]">
+          
           {/* 1. Risk Score Section */}
-          <section className="flex flex-col gap-4">
-            <h2 className="text-xl font-bold text-zinc-900 tracking-tight">Risk Score</h2>
-            <div className={cn(
-              "border rounded-xl p-8 flex flex-col sm:flex-row items-center gap-6 shadow-sm",
-              getRiskScoreColor(riskScore)
-            )}>
-              <span className="text-7xl font-extrabold tracking-tight">{riskScore}</span>
-              <div className="flex flex-col text-left">
-                <span className="font-bold text-lg text-zinc-900">
-                  {riskScore >= 80 ? "Critical Reliability Risk" : riskScore >= 50 ? "Moderate Reliability Risk" : "Secure API Target"}
-                </span>
-                <p className="text-sm text-zinc-650 mt-1 max-w-xl leading-relaxed">
-                  {summary}
-                </p>
+          <motion.section
+            id="risk-score"
+            initial={{ opacity: 0, y: 12 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className="scroll-mt-[120px]"
+          >
+            <div className="bg-[#FFFFFF] border border-[#E7E5E2] rounded-[14px] p-[20px] flex flex-col sm:flex-row gap-[20px]">
+              <div className="flex flex-col flex-shrink-0">
+                <div className="flex items-baseline gap-1">
+                  <span className={cn("text-[36px] font-[800] leading-none", severityPill.colorClass)}>
+                    {riskScore}
+                  </span>
+                  <span className="text-[16px] font-[600] text-[#A3A099]">/100</span>
+                </div>
+                <div className="mt-2">
+                  <span className={cn(
+                    "text-[11px] font-[700] uppercase tracking-[0.04em] px-[10px] py-[4px] rounded-full inline-block",
+                    severityPill.bg,
+                    severityPill.text
+                  )}>
+                    {severityPill.label}
+                  </span>
+                </div>
+              </div>
+              <div className="text-[14px] text-[#111110] font-[400] leading-relaxed flex items-center">
+                <p>{renderHighlightedSummary(summary, severityPill.colorClass)}</p>
               </div>
             </div>
-          </section>
+          </motion.section>
 
           {/* 2. Findings Section */}
-          {findings.length > 0 && (
-            <section className="flex flex-col gap-4">
-              <h2 className="text-xl font-bold text-zinc-900 tracking-tight">Findings</h2>
-              <div className="flex flex-col gap-3">
-                {findings.map((f) => {
-                  const isExpanded = !!expandedFindings[f.id];
-                  return (
-                    <Card key={f.id} className="border border-zinc-200 hover:shadow-sm transition-all overflow-hidden">
-                      <div
-                        onClick={() => toggleFinding(f.id)}
-                        className="flex items-center justify-between p-5 cursor-pointer bg-zinc-50/50 hover:bg-zinc-50 select-none transition-colors"
-                      >
-                        <div className="flex items-center gap-3">
-                          {getSeverityBadge(f.severity)}
-                          <h3 className="font-bold text-sm sm:text-base text-zinc-800">{f.title}</h3>
-                        </div>
-                        {isExpanded ? <ChevronUp className="h-4.5 w-4.5 text-zinc-400" /> : <ChevronDown className="h-4.5 w-4.5 text-zinc-400" />}
+          <motion.section
+            id="findings"
+            initial={{ opacity: 0, y: 12 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className="flex flex-col gap-4 scroll-mt-[120px]"
+          >
+            <h2 className="text-[18px] font-[700] text-[#111110] tracking-tight mt-[32px]">Findings</h2>
+            <div className="flex flex-col gap-3">
+              {findings.map((f, i) => {
+                const isExpanded = !!expandedFindings[f.id];
+                return (
+                  <motion.div
+                    initial={{ opacity: 0, y: 12 }}
+                    whileInView={{ opacity: 1, y: 0 }}
+                    viewport={{ once: true }}
+                    transition={{ duration: 0.35, ease: "easeOut", delay: i * 0.05 }}
+                    key={f.id}
+                    className="bg-[#FFFFFF] border border-[#E7E5E2] rounded-[14px] hover:border-[#D4D1CC] transition-colors overflow-hidden"
+                  >
+                    <div
+                      onClick={() => toggleFinding(f.id)}
+                      className="flex items-center justify-between p-[18px_20px] cursor-pointer select-none"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className={cn(
+                          "text-[11px] font-[700] uppercase px-[10px] py-[4px] rounded-full",
+                          getFindingSeverityBadge(f.severity)
+                        )}>
+                          {f.severity}
+                        </span>
+                        <h3 className="font-[600] text-[15px] text-[#111110]">{f.title}</h3>
                       </div>
+                      <ChevronDown
+                        className={cn(
+                          "h-[18px] w-[18px] text-[#A3A099] transition-transform duration-300",
+                          isExpanded ? "rotate-180" : "rotate-0"
+                        )}
+                      />
+                    </div>
 
+                    <AnimatePresence initial={false}>
                       {isExpanded && (
-                        <CardContent className="p-6 border-t border-zinc-100 flex flex-col gap-5 bg-white">
-                          <p className="text-sm text-zinc-600 leading-relaxed">
-                            {f.explanation}
-                          </p>
-
-                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <div>
-                              <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Affected Endpoints</h4>
-                              <div className="flex flex-wrap gap-1.5 mt-2">
+                        <motion.div
+                          initial={{ height: 0, opacity: 0 }}
+                          animate={{ height: "auto", opacity: 1 }}
+                          exit={{ height: 0, opacity: 0 }}
+                          transition={{ duration: 0.3, ease: "easeInOut" }}
+                          className="overflow-hidden"
+                        >
+                          <div className="p-[0_20px_20px_20px] flex flex-col gap-4 border-t border-transparent">
+                            <div className="pt-2">
+                              <p className="text-[14px] text-[#6F6B66] leading-relaxed">
+                                {f.explanation}
+                              </p>
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                              <span className="text-[11px] font-[700] text-[#A3A099] uppercase tracking-[0.04em]">Affected Endpoints</span>
+                              <div className="flex flex-wrap gap-2">
                                 {f.endpoints.map((e) => (
-                                  <Badge key={e} variant="outline" className="font-mono text-[10px]">
+                                  <span key={e} className="bg-[#F8FAFC] border border-[#E2E8F0] text-[12px] font-mono px-[8px] py-[2px] rounded-[6px] text-[#111110]">
                                     {e}
-                                  </Badge>
+                                  </span>
                                 ))}
                               </div>
                             </div>
-
-                            <div>
-                              <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Exposed by Failure Modes</h4>
-                              <div className="flex flex-wrap gap-1.5 mt-2">
-                                {f.failures.map((fail) => (
-                                  <Badge key={fail} variant="secondary" className="text-[10px]">
-                                    {fail}
-                                  </Badge>
+                            <div className="flex flex-col gap-1.5">
+                              <span className="text-[11px] font-[700] text-[#A3A099] uppercase tracking-[0.04em]">Failure Modes</span>
+                              <div className="flex flex-wrap items-center gap-2 text-[13px] text-[#111110]">
+                                {f.failures.map((fail, idx) => (
+                                  <div key={fail} className="flex items-center gap-2">
+                                    <span>{fail}</span>
+                                    {idx < f.failures.length - 1 && <span className="text-[#D4D1CC]">&middot;</span>}
+                                  </div>
                                 ))}
                               </div>
                             </div>
                           </div>
-                        </CardContent>
+                        </motion.div>
                       )}
-                    </Card>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+                    </AnimatePresence>
+                  </motion.div>
+                );
+              })}
+            </div>
+          </motion.section>
 
-          {/* 3. Fixes Section */}
-          {fixes.length > 0 && (
-            <section className="flex flex-col gap-4">
-              <h2 className="text-xl font-bold text-zinc-900 tracking-tight">Fixes</h2>
-              <div className="flex flex-col gap-6">
-                {fixes.map((fix) => (
-                  <Card key={fix.id} className="border border-zinc-200">
-                    <CardHeader className="pb-3">
-                      <CardTitle className="text-lg font-bold text-zinc-900">{fix.title}</CardTitle>
-                    </CardHeader>
-                    <CardContent className="flex flex-col gap-4">
-                      <p className="text-sm text-zinc-650 leading-relaxed">
-                        {fix.explanation}
-                      </p>
+          {/* 3. Pull Requests Section */}
+          <motion.section
+            id="pull-requests"
+            initial={{ opacity: 0, y: 12 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className="flex flex-col gap-4 scroll-mt-[120px]"
+          >
+            <h2 className="text-[18px] font-[700] text-[#111110] tracking-tight mt-[16px]">Pull Requests</h2>
+            <div className="flex flex-col gap-3">
+              {prs.length === 0 && (
+                <p className="text-[14px] text-[#A3A099]">No pull requests generated yet.</p>
+              )}
+              {prs.map((pr, i) => {
+                let badgeStyle = "bg-[#F3F2F0] text-[#6F6B66]"; // Closed
+                if (pr.status === "Merged") badgeStyle = "bg-[#F3E8FF] text-[#7E22CE]";
+                if (pr.status === "Open") badgeStyle = "bg-[#FFEDE3] text-[#E04E16]";
 
-                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-2">
-                        <div className="flex flex-col">
-                          <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Original Code</span>
-                          <pre className="bg-red-50/50 border border-red-150 p-4 rounded-xl font-mono text-[11px] leading-relaxed text-red-800 overflow-x-auto h-48 whitespace-pre shadow-inner">
-                            <code>{fix.beforeCode}</code>
-                          </pre>
-                        </div>
-
-                        <div className="flex flex-col relative group">
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Fixed Code</span>
-                            <button
-                              onClick={() => handleCopy(fix.id, fix.afterCode)}
-                              className="text-xs text-zinc-400 hover:text-zinc-600 flex items-center gap-1 transition-colors"
-                              title="Copy code"
-                            >
-                              {copiedFixId === fix.id ? (
-                                <>
-                                  <Check className="h-3.5 w-3.5 text-emerald-600" />
-                                  <span className="text-emerald-600 font-semibold">Copied!</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="h-3.5 w-3.5" />
-                                  <span>Copy</span>
-                                </>
-                              )}
-                            </button>
-                          </div>
-                          <pre className="bg-emerald-50/50 border border-emerald-150 p-4 rounded-xl font-mono text-[11px] leading-relaxed text-emerald-800 overflow-x-auto h-48 whitespace-pre shadow-inner">
-                            <code>{fix.afterCode}</code>
-                          </pre>
-                        </div>
+                return (
+                  <motion.div
+                    initial={{ opacity: 0, y: 12 }}
+                    whileInView={{ opacity: 1, y: 0 }}
+                    viewport={{ once: true }}
+                    transition={{ duration: 0.35, ease: "easeOut", delay: i * 0.05 }}
+                    key={pr.id}
+                    className="bg-[#FFFFFF] border border-[#E7E5E2] rounded-[14px] p-[20px] hover:border-[#D4D1CC] transition-colors flex flex-col gap-3"
+                  >
+                    <div className="flex justify-between items-start">
+                      <div className="flex items-center gap-2">
+                        <GitPullRequest className={cn("h-[16px] w-[16px]", pr.status === "Merged" ? "text-[#7E22CE]" : "text-[#111110]")} />
+                        <span className="text-[15px] font-[600] text-[#111110]">
+                          {pr.number} {pr.title}
+                        </span>
                       </div>
-                    </CardContent>
-                  </Card>
-                ))}
-              </div>
-            </section>
-          )}
+                      <span className={cn("text-[11px] font-[700] uppercase px-[10px] py-[4px] rounded-full", badgeStyle)}>
+                        {pr.status}
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center text-[13px] text-[#A3A099]">
+                      <div>
+                        <span>Changed file: </span>
+                        <span className="font-mono text-[#6F6B66]">{pr.fileChanged}</span>
+                        <span className="mx-2">&middot;</span>
+                        <span>Branch: </span>
+                        <span className="font-mono text-[#6F6B66]">{pr.branch}</span>
+                      </div>
+                      <a
+                        href={pr.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[13px] text-[#E04E16] hover:text-[#FF5A1F] transition-colors"
+                      >
+                        View on GitHub &rarr;
+                      </a>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </div>
+          </motion.section>
 
-          {/* 4. Pull Requests Section (Conditional) */}
-          {prs.length > 0 && (
-            <section className="flex flex-col gap-4">
-              <h2 className="text-xl font-bold text-zinc-900 tracking-tight">GitHub Pull Requests</h2>
-              <div className="flex flex-col gap-4">
-                {prs.map((pr) => {
-                  const isMerged = pr.status.toLowerCase() === "merged";
-                  const isMerging = mergingPrId === pr.id;
+          {/* 4. Fixes Section */}
+          <motion.section
+            id="fixes"
+            initial={{ opacity: 0, y: 12 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.35, ease: "easeOut" }}
+            className="flex flex-col gap-4 scroll-mt-[120px]"
+          >
+            <h2 className="text-[18px] font-[700] text-[#111110] tracking-tight mt-[16px]">Fixes</h2>
+            <div className="flex flex-col gap-5">
+              {fixes.length === 0 && (
+                <p className="text-[14px] text-[#A3A099]">No fixes generated yet.</p>
+              )}
+              {fixes.map((fix, i) => (
+                <motion.div
+                  initial={{ opacity: 0, y: 12 }}
+                  whileInView={{ opacity: 1, y: 0 }}
+                  viewport={{ once: true }}
+                  transition={{ duration: 0.35, ease: "easeOut", delay: i * 0.05 }}
+                  key={fix.id}
+                  className="bg-[#FFFFFF] border border-[#E7E5E2] rounded-[14px] p-[24px] mb-[20px] flex flex-col gap-4"
+                >
+                  <h3 className="text-[16px] font-[700] text-[#111110]">{fix.title}</h3>
+                  <p className="text-[14px] text-[#6F6B66] leading-relaxed max-w-[100ch]">
+                    {fix.explanation}
+                  </p>
 
-                  return (
-                    <Card key={pr.id} className="border border-zinc-200">
-                      <CardContent className="p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-6">
-                        <div className="flex flex-col gap-2">
-                          <div className="flex items-center gap-3">
-                            <GitPullRequest className={cn("h-5 w-5", isMerged ? "text-purple-500" : "text-emerald-500")} />
-                            <span className="text-xs text-zinc-400 font-semibold">{pr.number}</span>
-                            <h3 className="font-bold text-zinc-800 text-sm sm:text-base">{pr.title}</h3>
-                          </div>
-                          <div className="flex items-center gap-2 text-xs text-zinc-500 font-mono mt-1">
-                            <span>Changed file: {pr.fileChanged}</span>
-                            <span>&middot;</span>
-                            <span>Branch: {pr.branch}</span>
-                          </div>
-                        </div>
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-[16px] mt-2">
+                    {/* Original Code */}
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center h-[24px]">
+                        <span className="text-[11px] font-[700] text-[#A3A099] uppercase tracking-[0.04em]">Original Code</span>
+                      </div>
+                      <div className="relative">
+                        <pre className="bg-[#FEF2F2] border border-[#FECACA] rounded-[10px] p-[16px] font-mono text-[13px] leading-relaxed text-red-900 overflow-auto h-[280px] shadow-inner custom-scrollbar">
+                          <code>{fix.beforeCode}</code>
+                        </pre>
+                        <div className="absolute bottom-[1px] left-[1px] right-[1px] h-[8px] bg-gradient-to-t from-[#FEF2F2] to-transparent rounded-b-[9px] pointer-events-none" />
+                      </div>
+                    </div>
 
-                        <div className="flex items-center gap-3 shrink-0">
-                          {isMerged ? (
-                            <Badge className="bg-purple-100 text-purple-800 border border-purple-200 font-semibold flex items-center gap-1">
-                              <GitMerge className="h-3 w-3" />
-                              <span>Merged</span>
-                            </Badge>
+                    {/* Fixed Code */}
+                    <div className="flex flex-col gap-2">
+                      <div className="flex items-center justify-between h-[24px]">
+                        <span className="text-[11px] font-[700] text-[#A3A099] uppercase tracking-[0.04em]">Fixed Code</span>
+                        <button
+                          onClick={() => handleCopy(fix.id, fix.afterCode)}
+                          className={cn(
+                            "text-[12px] flex items-center gap-1.5 transition-colors",
+                            copiedFixId === fix.id ? "text-[#16A34A]" : "text-[#6F6B66] hover:text-[#111110]"
+                          )}
+                        >
+                          {copiedFixId === fix.id ? (
+                            <>
+                              <span>Copied</span>
+                              <Check className="h-[12px] w-[12px]" />
+                            </>
                           ) : (
                             <>
-                              <Badge className="bg-emerald-100 text-emerald-800 border border-emerald-200 font-semibold">
-                                Open
-                              </Badge>
-                              <a
-                                href={pr.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "flex items-center gap-1.5")}
-                              >
-                                <span>View on GitHub</span>
-                                <ExternalLink className="h-3.5 w-3.5" />
-                              </a>
-                              <Button
-                                size="sm"
-                                disabled={isMerging}
-                                onClick={() => handleMergePR(pr.id)}
-                                className="flex items-center gap-1.5"
-                              >
-                                {isMerging ? (
-                                  <>
-                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                    <span>Merging...</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <GitMerge className="h-3.5 w-3.5" />
-                                    <span>Merge PR</span>
-                                  </>
-                                )}
-                              </Button>
+                              <Copy className="h-[12px] w-[12px]" />
+                              <span>Copy</span>
                             </>
                           )}
-                        </div>
-                      </CardContent>
-                    </Card>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-        </>
-      )}
+                        </button>
+                      </div>
+                      <div className="relative">
+                        <pre className="bg-[#F0FDF4] border border-[#BBF7D0] rounded-[10px] p-[16px] font-mono text-[13px] leading-relaxed text-green-900 overflow-auto h-[280px] shadow-inner custom-scrollbar">
+                          <code>{fix.afterCode}</code>
+                        </pre>
+                        <div className="absolute bottom-[1px] left-[1px] right-[1px] h-[8px] bg-gradient-to-t from-[#F0FDF4] to-transparent rounded-b-[9px] pointer-events-none" />
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              ))}
+            </div>
+          </motion.section>
+
+        </div>
+      </div>
     </div>
   );
 }
